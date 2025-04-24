@@ -83,13 +83,15 @@ extern LONG g_bHookEnabled;
 #include "gdiPlusFlat2.h"
 
 #ifdef USE_DETOURS
+//detours
 #include "detours.h"
-#define HOOK_DEFINE(rettype, name, argtype) \
+//
+#define HOOK_MANUALLY(rettype, name, argtype, arglist) ;
+#define HOOK_DEFINE(rettype, name, argtype, arglist) \
 	DetourDetach(&(PVOID&)ORIG_##name, IMPL_##name);
-static LONG hook_term()
+LONG hook_term()
 {
 	DetourTransactionBegin();
-
 	DetourUpdateThread(GetCurrentThread());
 
 #include "hooklist.h"
@@ -102,10 +104,12 @@ static LONG hook_term()
 	return error;
 }
 #undef HOOK_DEFINE
+#undef HOOK_MANUALLY
+
 #else
 #include "easyhook.h"
-#define HOOK_MANUALLY(rettype, name, argtype) ;
-#define HOOK_DEFINE(rettype, name, argtype) \
+#define HOOK_MANUALLY(rettype, name, argtype, arglist) ;
+#define HOOK_DEFINE(rettype, name, argtype, arglist) \
 	ORIG_##name = name;
 #pragma optimize("s", on)
 static LONG hook_term()
@@ -1030,4 +1034,15 @@ EXTERN_C LPWSTR WINAPI GdippEnvironment(DWORD& dwCreationFlags, LPVOID lpEnviron
 
 	dwCreationFlags |= CREATE_UNICODE_ENVIRONMENT;
 	return pEnvW;
+}
+
+void DebugOut(const WCHAR* szFormat, ...) {
+#ifdef TRACE
+	va_list args;
+	va_start(args, szFormat);
+	WCHAR buffer[1024] = { 0 };
+	vswprintf(buffer, szFormat, args);
+	std::wstring fullmsg = L"[MTCore] " + std::wstring(buffer);
+	OutputDebugString(fullmsg.c_str());
+#endif
 }

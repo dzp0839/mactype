@@ -52,6 +52,10 @@ public:
 
 typedef map<HFONT, CFontSubResult*> CFontCache;
 typedef set<HDC> CDCArray;
+typedef map<HDC, HDC> CDCRelationCache;
+typedef map<HDC, HWND> CDCHwndCache;
+typedef map<HDC, int> CDCRefCache;
+typedef map<HPAINTBUFFER, HDC> CPaintBufferCache;
 
 class CThreadLocalInfo
 {
@@ -121,7 +125,7 @@ BOOL IsProcessUnload();
 BOOL IsExeUnload(LPCTSTR lpApp);
 
 #define HOOK_MANUALLY HOOK_DEFINE
-#define HOOK_DEFINE(rettype, name, argtype) \
+#define HOOK_DEFINE(rettype, name, argtype, arglist) \
 	extern rettype (WINAPI * ORIG_##name) argtype; \
 	extern rettype WINAPI IMPL_##name argtype;
 #include "hooklist.h"
@@ -133,9 +137,9 @@ void AddFontToFT(HFONT hf, LPCTSTR lpszFace, int weight, bool italic);
 void AddFontToFT(LPCTSTR lpszFace, int weight, bool italic);
 int MyGetProcAddress(HMODULE dll, LPSTR funcname);
 
-#define HOOK_MANUALLY(rettype, name, argtype) \
+#define HOOK_MANUALLY(rettype, name, argtype, arglist) \
 	LONG hook_demand_##name(bool bForce);
-#define HOOK_DEFINE(rettype, name, argtype) ;
+#define HOOK_DEFINE(rettype, name, argtype, arglist) ;
 #include "hooklist.h"
 #undef HOOK_DEFINE
 #undef HOOK_MANUALLY

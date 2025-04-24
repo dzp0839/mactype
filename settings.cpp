@@ -4,17 +4,69 @@
 #include "supinfo.h"
 #include "fteng.h"
 #include <stdlib.h>
+#include <freetype/ftmodapi.h>
 #ifdef INFINALITY
 #include <freetype/ftenv.h>
 #endif
+
+CControlCenter* g_ControlCenter = NULL;
 
 inline BOOL IsFolder(LPCTSTR pszPath) {
 	return pszPath && *pszPath && *(pszPath + wcslen(pszPath) - 1) == '\\';
 }
 
+int _StrToInt(LPCTSTR pStr, int nDefault)
+{
+#define isspace(ch)		(ch == _T('\t') || ch == _T(' '))
+#define isdigit(ch)		((_TUCHAR)(ch - _T('0')) <= 9)
+
+	int ret;
+	bool neg = false;
+	LPCTSTR pStart;
+
+	for (; isspace(*pStr); pStr++);
+	switch (*pStr) {
+	case _T('-'):
+		neg = true;
+	case _T('+'):
+		pStr++;
+		break;
+	}
+
+	pStart = pStr;
+	ret = 0;
+	for (; isdigit(*pStr); pStr++) {
+		ret = 10 * ret + (*pStr - _T('0'));
+	}
+
+	if (pStr == pStart) {
+		return nDefault;
+	}
+	return neg ? -ret : ret;
+
+#undef isspace
+#undef isdigit
+}
+
 wstring LowerCase(wstring str) {
 	transform(str.begin(), str.end(), str.begin(), ::tolower);
 	return str;
+}
+
+// split a comma separated string into an int vector
+vector<int> SplitString(LPCTSTR str) {
+	CStringTokenizer token;
+	vector<int> intList;
+	int argc = 0;
+	argc = token.Parse(str);
+
+	for (int i = 0; i < 6; i++) {
+		LPCTSTR arg = token.GetArgument(i);
+		if (!arg)
+			break;
+		intList.push_back(_StrToInt(arg, 0));
+	}
+	return intList;
 }
 
 const wstring GetAppDir() {
@@ -41,7 +93,7 @@ static const TCHAR c_szDirectWrite[] = _T("DirectWrite");
 #define HINTING_MIN			0
 #define HINTING_MAX			2
 #define AAMODE_MIN			-1
-#define AAMODE_MAX			5
+#define AAMODE_MAX			6
 #define GAMMAVALUE_MIN		0.0625f
 #define GAMMAVALUE_MAX		20.0f
 #define CONTRAST_MIN		0.0625f
@@ -122,9 +174,9 @@ void CGdippSettings::DelayedInit()
 	}	
 
 	//ForceChangeFont
-	if (m_szForceChangeFont[0]) {
-		EnumFontFamilies(hdcScreen, m_szForceChangeFont, EnumFontFamProc, reinterpret_cast<LPARAM>(this));
-	}
+	//if (m_szForceChangeFont[0]) {
+	//	EnumFontFamilies(hdcScreen, m_szForceChangeFont, EnumFontFamProc, reinterpret_cast<LPARAM>(this));
+	//}
 	//fetch screen dpi
 	m_nScreenDpi = GetDeviceCaps(hdcScreen, LOGPIXELSX);
 	ReleaseDC(NULL, hdcScreen);
@@ -170,6 +222,70 @@ void CGdippSettings::DelayedInit()
 	//FontLink
 	if (FontLink()) {
 		m_fontlinkinfo.init();
+	}
+
+	// check wheteher harmony LCD should be used over ClearType
+	FT_LCDMode_Set(freetype_library, this->HarmonyLCD() ? 1 : 0);
+
+	// Init LCD settings
+	// this->m_bHarmonyLCDRendering = FT_Library_SetLcdFilter(NULL, FT_LCD_FILTER_NONE) == FT_Err_Unimplemented_Feature; // official method of detecting freetype mode.
+	if (this->HarmonyLCD()) {
+		FT_Library_SetLcdFilter(NULL, FT_LCD_FILTER_NONE);
+		// Harmony LCD rendering
+		if (m_bUseCustomPixelLayout) {
+			FT_Vector  sub[3] = { { m_arrPixelLayout[0], m_arrPixelLayout[1]}, 
+									{m_arrPixelLayout[2], m_arrPixelLayout[3]},	 
+									{m_arrPixelLayout[4], m_arrPixelLayout[5]}};	// custom layout
+			FT_Library_SetLcdGeometry(freetype_library, sub);
+		}
+		else {
+			switch (this->m_FontSettings.GetAntiAliasMode()) {
+			case 0:
+			case 1: {
+				FT_Vector  sub[3] = { { 0, 0 }, { 0, 0 },	 { 0, 0 } };	// gray scale
+				FT_Library_SetLcdGeometry(freetype_library, sub);
+				break;
+			}
+			case 2: //RGB
+			case 4: {
+				FT_Vector  sub[3] = { { -21, 0 }, { 0, 0 },	 { 21, 0 } };
+				FT_Library_SetLcdGeometry(freetype_library, sub);
+				break;
+			}
+			case 3:	//BGR
+			case 5: {
+				FT_Vector  sub[3] = { { 21, 0 }, { 0, 0 },	 { -21, 0 } };
+				FT_Library_SetLcdGeometry(freetype_library, sub);
+				break;
+			}
+			case 6: {
+				//Pentile
+				FT_Vector  sub[3] = { {-11, 16}, {-11, -16}, {22, 0} };
+				FT_Library_SetLcdGeometry(freetype_library, sub);
+				break;
+			}
+			}
+			if (m_FontSettings.GetAntiAliasMode() > 2)
+				m_FontSettings.SetAntiAliasMode(2);	// all non-grayscale panel should use DrawLCD routine as its output.
+		}
+	}
+	else {
+		int nLcdFilter = LcdFilter();
+		if ((int)FT_LCD_FILTER_NONE <= nLcdFilter && nLcdFilter < (int)FT_LCD_FILTER_MAX) {
+			switch (GetFontSettings().GetAntiAliasMode()) {
+			case 1:
+			case 4:
+			case 5:
+				nLcdFilter = FT_LCD_FILTER_LIGHT;	// now we apply a light filter to lcd based on AA mode automatically, unless a custom lcd filter is defined.
+			}
+			FT_Library_SetLcdFilter(freetype_library, (FT_LcdFilter)nLcdFilter);
+			if (UseCustomLcdFilter())
+			{
+				unsigned char buff[5];
+				memcpy(buff, LcdFilterWeights(), sizeof(buff));
+				FT_Library_SetLcdFilterWeights(freetype_library, buff);
+			}
+		}
 	}
 
 
@@ -445,6 +561,7 @@ bool CGdippSettings::LoadAppSettings(LPCTSTR lpszFile)
 	fs.SetBoldWeight(_GetFreeTypeProfileBoundInt(_T("BoldWeight"), 0, BWEIGHT_MIN, BWEIGHT_MAX, lpszFile));
 	fs.SetItalicSlant(_GetFreeTypeProfileBoundInt(_T("ItalicSlant"), 0, SLANT_MIN, SLANT_MAX, lpszFile));
 	fs.SetKerning(!!_GetFreeTypeProfileInt(_T("EnableKerning"), 0, lpszFile));
+	m_nAntiAliasModeForDW = fs.GetAntiAliasMode();	// DirectWrite always use the user defined AA mode.
 	{
 		TCHAR szShadow[256];
 		CStringTokenizer token;
@@ -519,12 +636,7 @@ SKIP:
 													 SETTING_FONTSUBSTITUTE_ALL,
 													 lpszFile);
 	m_nWidthMode = SETTING_WIDTHMODE_GDI32;
-/*
-	_GetFreeTypeProfileBoundInt(_T("WidthMode"),
-											   SETTING_WIDTHMODE_GDI32,
-											   SETTING_WIDTHMODE_GDI32,
-											   SETTING_WIDTHMODE_FREETYPE,
-											   lpszFile);*/
+	
 
 	m_nFontLoader = _GetFreeTypeProfileBoundInt(_T("FontLoader"),
 												SETTING_FONTLOADER_FREETYPE,
@@ -535,6 +647,16 @@ SKIP:
 	m_nCacheMaxFaces = m_nCacheMaxFaces > 64 ? m_nCacheMaxFaces : 64;
 	m_nCacheMaxSizes = _GetFreeTypeProfileInt(_T("CacheMaxSizes"), 1200, lpszFile);
 	m_nCacheMaxBytes = _GetFreeTypeProfileInt(_T("CacheMaxBytes"), 10485760, lpszFile);
+
+	//parse display affinity string into an integer set
+	{
+		TCHAR sAffinity[260] = { 0 };
+		_GetFreeTypeProfileString(_T("DisplayAffinity"), _T(""), sAffinity, 256, lpszFile);
+		auto displays = SplitString(sAffinity);
+		for (auto id : displays) {
+			m_nDisplayAffinity.insert(id);
+		}
+	}
 
 	//experimental settings:
 	m_bEnableClipBoxFix = !!_GetFreeTypeProfileIntFromSection(_T("Experimental"), _T("ClipBoxFix"), 1, lpszFile);
@@ -597,7 +719,7 @@ SKIP:
 	// フォント指定
 	ZeroMemory(&m_lfForceFont, sizeof(LOGFONT));
 	m_szForceChangeFont[0] = _T('\0');
-	_GetFreeTypeProfileString(_T("ForceChangeFont"), _T(""), m_szForceChangeFont, LF_FACESIZE, lpszFile);
+	//_GetFreeTypeProfileString(_T("ForceChangeFont"), _T(""), m_szForceChangeFont, LF_FACESIZE, lpszFile);
 
 	// OSのバージョンがXP以降かどうか
 	//OSVERSIONINFO osvi = { sizeof(OSVERSIONINFO) };
@@ -663,16 +785,10 @@ SKIP:
 		m_bUseCustomLcdFilter = AddLcdFilterFromSection(names.c_str(), lpszFile, m_arrLcdFilterWeights);
 	else
 		m_bUseCustomLcdFilter = AddLcdFilterFromSection(_T("LcdFilterWeight"), lpszFile, m_arrLcdFilterWeights);
+	
+	m_bUseCustomPixelLayout = AddPixelModeFromSection(_T("PixelLayout"), lpszFile, m_arrPixelLayout);
 
 	return true;
-}
-
-int CALLBACK CGdippSettings::EnumFontFamProc(const LOGFONT* lplf, const TEXTMETRIC* /*lptm*/, DWORD FontType, LPARAM lParam)
-{
-	CGdippSettings* pThis = reinterpret_cast<CGdippSettings*>(lParam);
-	if (pThis && FontType == TRUETYPE_FONTTYPE)
-		pThis->m_lfForceFont = *lplf;
-	return 0;
 }
 
 bool CGdippSettings::AddExcludeListFromSection(LPCTSTR lpszSection, LPCTSTR lpszFile, set<wstring> & arr)
@@ -743,6 +859,30 @@ bool CGdippSettings::AddLcdFilterFromSection(LPCTSTR lpszKey, LPCTSTR lpszFile, 
 	return true;
 }
 
+bool CGdippSettings::AddPixelModeFromSection(LPCTSTR lpszKey, LPCTSTR lpszFile, char* arr)
+{
+	TCHAR buffer[100];
+	_GetFreeTypeProfileString(lpszKey, _T("\0"), buffer, sizeof(buffer), lpszFile);
+	if (buffer[0] == '\0') {
+		SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+		return false;
+	}
+
+	LPTSTR p = buffer;
+	CStringTokenizer token;
+	int argc = 0;
+	argc = token.Parse(buffer);
+
+	for (int i = 0; i < 6; i++) {
+		LPCTSTR arg = token.GetArgument(i);
+		if (!arg)
+			return false;	
+		arr[i] = _StrToInt(arg, arr[i]);
+	}
+
+	return true;
+}
+
 bool CGdippSettings::AddIndividualFromSection(LPCTSTR lpszSection, LPCTSTR lpszFile, IndividualArray& arr)
 {
 	LPTSTR  buffer = _GetPrivateProfileSection(lpszSection, lpszFile);
@@ -806,40 +946,6 @@ bool CGdippSettings::AddIndividualFromSection(LPCTSTR lpszSection, LPCTSTR lpszF
 LPTSTR CGdippSettings::_GetPrivateProfileSection(LPCTSTR lpszSection, LPCTSTR lpszFile)
 {
 	return const_cast<LPTSTR>((LPCTSTR)m_Config[lpszSection]);
-}
-
-//atolにデフォルト値を返せるようにしたような物
-int CGdippSettings::_StrToInt(LPCTSTR pStr, int nDefault)
-{
-#define isspace(ch)		(ch == _T('\t') || ch == _T(' '))
-#define isdigit(ch)		((_TUCHAR)(ch - _T('0')) <= 9)
-
-	int ret;
-	bool neg = false;
-	LPCTSTR pStart;
-
-	for (; isspace(*pStr); pStr++);
-	switch (*pStr) {
-	case _T('-'):
-		neg = true;
-	case _T('+'):
-		pStr++;
-		break;
-	}
-
-	pStart = pStr;
-	ret = 0;
-	for (; isdigit(*pStr); pStr++) {
-		ret = 10 * ret + (*pStr - _T('0'));
-	}
-
-	if (pStr == pStart) {
-		return nDefault;
-	}
-	return neg ? -ret : ret;
-
-#undef isspace
-#undef isdigit
 }
 
 int CGdippSettings::_httoi(const TCHAR *value)
@@ -1119,7 +1225,10 @@ const CFontSettings& CGdippSettings::FindIndividual(LPCTSTR lpFaceName) const
 
 	for(; p != end; ++p) {
 		if (p->GetHash() == hash) {
-			return p->GetIndividual();
+			CFontSettings& result = p->GetIndividual();
+			if (result.GetAntiAliasMode() > 2 && HarmonyLCD())
+				result.SetAntiAliasMode(2);
+			return result;
 		}
 	}
 	return GetFontSettings();
@@ -1152,15 +1261,12 @@ bool CGdippSettings::CopyForceFont(LOGFONT& lf, const LOGFONT& lfOrg) const
 	if (GetLastError()!=ERROR_ENVVAR_NOT_FOUND)
 		return false;
 	//&lf == &lfOrgも可
-	bool bForceFont = !!GetForceFontName();
+	bool bForceFont = false;
 	BOOL bFontExist = true;
 	const LOGFONT *lplf;
-	if (bForceFont) {
-		lplf = &m_lfForceFont;
-	} else {
-		lplf = GetFontSubstitutesInfo().lookup((LOGFONT&)lfOrg);
-		if (lplf) bForceFont = true;
-	}
+	lplf = GetFontSubstitutesInfo().lookup((LOGFONT&)lfOrg);
+	if (lplf) bForceFont = true;
+
 	if (bForceFont) {
 		memcpy(&lf, &lfOrg, sizeof(LOGFONT)-sizeof(lf.lfFaceName));
 		StringCchCopy(lf.lfFaceName, LF_FACESIZE, lplf->lfFaceName);
@@ -1476,7 +1582,7 @@ bool CFontSubstituteData::initnocheck(LPCTSTR config) {
 	}
 	if (p >= buf) {
 		StringCchCopy(m_lf.lfFaceName, countof(m_lf.lfFaceName), buf);
-		m_lf.lfCharSet = (BYTE)CGdippSettings::_StrToInt(p + 1, 0);
+		m_lf.lfCharSet = (BYTE)_StrToInt(p + 1, 0);
 		m_bCharSet = true;
 	}
 	else {
@@ -1506,7 +1612,7 @@ bool CFontSubstituteData::init(LPCTSTR config)
 	}
 	if (p >= buf) {
 		StringCchCopy(lf.lfFaceName, countof(lf.lfFaceName), buf);
-		lf.lfCharSet = (BYTE)CGdippSettings::_StrToInt(p + 1, 0);
+		lf.lfCharSet = (BYTE)_StrToInt(p + 1, 0);
 		m_bCharSet = true;
 	} else {
 		StringCchCopy(lf.lfFaceName, LF_FACESIZE, buf);
@@ -1651,7 +1757,7 @@ CFontSubstitutesInfo::lookup(LOGFONT& lf) const
 			{
 				mylf.lfClipPrecision = FONT_MAGIC_NUMBER;
 				HFONT tempfont = CreateFontIndirect(&mylf);
-				HDC dc=CreateCompatibleDC(NULL);
+				HDC dc = CreateCompatibleDC(NULL);
 				HFONT oldfont = SelectFont(dc, tempfont);
 				ORIG_GetTextFaceW(dc, LF_FACESIZE, mylf.lfFaceName);
 				SelectFont(dc, oldfont);

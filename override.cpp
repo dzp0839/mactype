@@ -14,7 +14,8 @@
 #pragma comment(lib, "Gdi32.lib")
 #pragma comment(lib, "User32.lib")
 #pragma comment(lib, "WindowsCodecs.lib")
-#pragma comment (lib, "dwrite.lib")
+#pragma comment(lib, "dwrite.lib")
+#pragma comment(lib, "uxtheme.lib")
 
 #if defined(_DEBUG)
 void Dbg_TractGetTextExtent(LPCSTR lpString, int cbString, LPSIZE lpSize);
@@ -44,6 +45,10 @@ typedef HRESULT (WINAPI* __DWriteCreateFactory)(
 
 CFontCache FontCache;
 CDCArray DCArray;
+CDCRelationCache DCRelation;
+CDCHwndCache DCHwndCache;
+CDCRefCache DCRef; // HDC reference count
+//CPaintBufferCache PaintBufferCache;
 wstring nullstring;
 BOOL g_ccbRender = true;
 BOOL g_ccbCache = true;
@@ -1057,6 +1062,62 @@ public:
 	}
 };
 
+// extract the possibly largest integer from the string
+int StrToBestInt(const WCHAR* wstr) {
+	int result = 0;
+	const WCHAR* ptr = wstr;
+
+	while ((*ptr < L'0' || *ptr > L'9') && *ptr != L'\0') ++ptr;	// fast forward to the digits
+	// Process digits
+	while (*ptr >= L'0' && *ptr <= L'9') {
+		int digit = *ptr - L'0';
+
+		// Overflow check
+		if (result > (INT_MAX - digit) / 10) {
+			return -1; // Overflow
+		}
+
+		result = result * 10 + digit;
+		++ptr;
+	}
+
+	return result;
+}
+
+int DisplayFromDC(HDC dc) {
+	if (!dc) {
+		return -1;
+	}
+	CCriticalSectionLock __lock(CCriticalSectionLock::CS_DCRELATION);
+	// fetch realDC from memoryDC
+	auto it = DCRelation.find(dc);
+	if (it != DCRelation.end()) {
+		dc = it->second;
+	}
+	HWND hwnd = NULL;
+	auto dit = DCHwndCache.find(dc);
+	if (dit != DCHwndCache.end()) {
+		hwnd = dit->second;
+	}
+	else {
+		hwnd = WindowFromDC(dc);
+	}
+	if (hwnd) {
+		auto monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL);
+		if (!monitor) return -1;	// Minimized window?
+
+		MONITORINFOEX mi;
+		mi.cbSize = sizeof(MONITORINFOEX);
+		GetMonitorInfo(monitor, &mi);
+		TRACE(L"Display name: %s\n", mi.szDevice);
+		return StrToBestInt(mi.szDevice);
+	}
+	else {
+		TRACE(L"!! Display not found: %d -------------\n", dc);
+	}
+	return -1;
+}
+
 extern ControlIder CID;
 // 取代Windows的ExtTextOutW
 BOOL WINAPI IMPL_ExtTextOutW(HDC hdc, int nXStart, int nYStart, UINT fuOptions, CONST RECT *lprc, LPCWSTR lpString, UINT cbString, CONST INT *SyslpDx)
@@ -1077,6 +1138,21 @@ BOOL WINAPI IMPL_ExtTextOutW(HDC hdc, int nXStart, int nYStart, UINT fuOptions, 
 
 	if (DCArray.find(hdc)!=DCArray.end())
 		return ORIG_ExtTextOutW(hdc, nXStart, nYStart, fuOptions, lprc, lpString, cbString, lpDx);
+
+	if (!(fuOptions & ETO_GLYPH_INDEX) && !(fuOptions & ETO_IGNORELANGUAGE) && !lpDx && CID.myiscomplexscript(lpString,cbString))		//complex script
+		return ORIG_ExtTextOutW(hdc, nXStart, nYStart, fuOptions, lprc, lpString, cbString, lpDx);
+	CGdippSettings* pSettings = CGdippSettings::GetInstance(); //获得一个配置文件实例
+
+	// check if per-display rendering is enabled
+	if (pSettings->DisplayAffinity().size()) {
+		set<int>& aff = pSettings->DisplayAffinity();
+		int id = DisplayFromDC(hdc);
+		if (id >= 0 && aff.find(id) == aff.end()) {
+			// display is not in the list, we should drop rendering for it.
+			return ORIG_ExtTextOutW(hdc, nXStart, nYStart, fuOptions, lprc, lpString, cbString, lpDx);
+		}
+	}
+
 	CAutoVectorPtr<INT> newdx;
 	if (!lpDx) {
 		newdx.Allocate(cbString);
@@ -1092,14 +1168,10 @@ BOOL WINAPI IMPL_ExtTextOutW(HDC hdc, int nXStart, int nYStart, UINT fuOptions, 
 			}
 			lpDx = newdx;
 		}
-		else{
+		else {
 			newdx.Free();
 		}
 	}
-
-	if (!(fuOptions & ETO_GLYPH_INDEX) && !(fuOptions & ETO_IGNORELANGUAGE) && !lpDx && CID.myiscomplexscript(lpString,cbString))		//complex script
-		return ORIG_ExtTextOutW(hdc, nXStart, nYStart, fuOptions, lprc, lpString, cbString, lpDx);
-	CGdippSettings* pSettings = CGdippSettings::GetInstance(); //获得一个配置文件实例
 
 /*
 
@@ -1659,7 +1731,7 @@ DWORD WINAPI IMPL_GetFontData(_In_ HDC     hdc,
 	if (dwTable != 0x656d616e)	// we only simulate the name table, for other tables, use the substituted font data
 		return ORIG_GetFontData(hdc, dwTable, dwOffset, pvBuffer, cjBuffer);
 
-	DWORD ret = (DWORD)INVALID_HANDLE_VALUE;
+	DWORD ret = GDI_ERROR;
 	ENUMLOGFONTEXDVW envlf = { 0 };
 	HFONT hCurFont = GetCurrentFont(hdc);
 	if (GetCachedFontLocale(hCurFont) && GetObjectW(hCurFont, sizeof(LOGFONT), &envlf.elfEnumLogfontEx.elfLogFont)) {// call hooked version of GetObject to retrieve font info that the app originally want to create
@@ -1673,11 +1745,151 @@ DWORD WINAPI IMPL_GetFontData(_In_ HDC     hdc,
 		}
 		DeleteDC(memdc);
 	}
-	if (ret == (DWORD)INVALID_HANDLE_VALUE)	// any of the above operations failed or the font is not substituted
+	if (ret == GDI_ERROR)	// any of the above operations failed or the font is not substituted
 		ret = ORIG_GetFontData(hdc, dwTable, dwOffset, pvBuffer, cjBuffer);	 // fallback to original
 	return ret;
 }
 
+/*
+HPAINTBUFFER WINAPI IMPL_BeginBufferedPaint(
+	HDC hdcTarget,
+	const RECT* prcTarget,
+	BP_BUFFERFORMAT dwFormat,
+	BP_PAINTPARAMS* pPaintParams,
+	HDC* phdc
+) {
+	CCriticalSectionLock __lock(CCriticalSectionLock::CS_DCRELATION);
+	auto ret = ORIG_BeginBufferedPaint(hdcTarget, prcTarget, dwFormat, pPaintParams, phdc);
+	// save relations between memoryDC and realDC
+	if (phdc && *phdc && hdcTarget) {
+		PaintBufferCache[ret] = *phdc;
+		// unchain dc relations
+		auto it = DCRelation.find(hdcTarget);
+		if (it != DCRelation.end()) {
+			TRACE(L"BeginBufferedPaint %d->%d->%d", *phdc, hdcTarget, it->second);
+			hdcTarget = it->second;
+		}
+		else {
+			TRACE(L"BeginBufferedPaint: %d->%d\n", *phdc, hdcTarget);
+		}
+		DCRelation[*phdc] = hdcTarget;
+	}
+	return ret;
+}
+
+HRESULT WINAPI IMPL_EndBufferedPaint(HPAINTBUFFER hBufferedPaint, BOOL fUpdateTarget) {
+	CCriticalSectionLock __lock(CCriticalSectionLock::CS_DCRELATION);
+	auto it = PaintBufferCache.find(hBufferedPaint);
+	// remove obsolete DC relations
+	if (it != PaintBufferCache.end()) {
+		TRACE(L"EndBufferedPaint %d", it->second);
+		DCRelation.erase(it->second);
+		PaintBufferCache.erase(it);
+	}
+	return ORIG_EndBufferedPaint(hBufferedPaint, fUpdateTarget);
+}
+*/
+
+void inline hdcAddRef(HDC dc)  {
+	auto it = DCRef.find(dc);
+	if (it == DCRef.end()) {
+		DCRef[dc] = 1;
+	}
+	else {
+		DCRef[dc] = it->second+1;
+	}
+}
+
+void inline hdcReleaseRef(HDC dc) {
+	auto it = DCRef.find(dc);
+	if (it != DCRef.end()) {
+		if (it->second > 1) {
+			DCRef[dc] = it->second-1;
+		}
+		else {
+			TRACE(L"%d is removed\n", dc);
+			DCRef.erase(it);
+		}
+	}
+}
+
+HWND getMyActiveWindow() {
+	HWND activeHwnd = GetForegroundWindow();
+	if (activeHwnd) {
+		DWORD processId;
+		GetWindowThreadProcessId(activeHwnd, &processId);
+		if (processId == GetCurrentProcessId()) {
+			// the active window belongs to the current process.
+			return activeHwnd;
+		}
+	}
+	// enum current top-level windows and return the first one.
+	EnumThreadWindows(GetCurrentThreadId(), [](HWND hwnd, LPARAM lParam)->BOOL {
+		*(HWND*)lParam = hwnd;
+		return false;
+		}, LPARAM(&activeHwnd));
+	return activeHwnd;
+}
+
+HDC WINAPI IMPL_CreateCompatibleDC(_In_opt_ HDC hdc) {
+	auto memdc = CreateCompatibleDC(hdc);
+	if (memdc) {
+		TRACE(L"CreateCompatibleDC: %d->%d\n", memdc, hdc);
+		CCriticalSectionLock __lock(CCriticalSectionLock::CS_DCRELATION);
+		// unchain dc relations
+		auto it = DCRelation.find(hdc);
+		if (it != DCRelation.end()) {
+			TRACE(L"Unchain: %d->%d->%d\n", memdc, hdc, it->second);
+			hdc = it->second;
+		}
+
+		hdcAddRef(memdc);
+		if (hdc) {
+			DCRelation[memdc] = hdc;
+			hdcAddRef(hdc);
+		}
+		else {
+			// hdc = 0, create a relationship
+			auto hWnd = getMyActiveWindow();
+			TRACE(L"[CreateCompatibleDC] Relation %d->%d\n", memdc, hWnd);
+			DCHwndCache[memdc] = hWnd;
+		}
+	}
+	return memdc;
+}
+
+BOOL WINAPI IMPL_DeleteDC(_In_ HDC hdc) {
+	auto ret = ORIG_DeleteDC(hdc);
+	if (ret) {
+		CCriticalSectionLock __lock(CCriticalSectionLock::CS_DCRELATION);
+		DCRelation.erase(hdc);
+		hdcReleaseRef(hdc);
+		TRACE(L"DeleteDC %d", hdc);
+	}
+	return ret;
+}
+
+HDC WINAPI IMPL_GetDC(_In_opt_ HWND hWnd) {
+	auto dc = ORIG_GetDC(hWnd);
+	if (dc) {
+		if (!hWnd) {
+			hWnd = getMyActiveWindow();
+		}
+		if (hWnd) {
+			CCriticalSectionLock __lock(CCriticalSectionLock::CS_DCRELATION);
+			TRACE(L"[GetDC] Custom Relation %d->%d\n", dc, hWnd);
+			hdcAddRef(dc);
+			DCHwndCache[dc] = hWnd;
+		}
+	}
+	return dc;
+}
+
+BOOL WINAPI IMPL_ReleaseDC(_In_opt_ HWND hWnd, _In_ HDC hDC) {
+	CCriticalSectionLock __lock(CCriticalSectionLock::CS_DCRELATION);
+	hdcReleaseRef(hDC);
+	return ORIG_ReleaseDC(hWnd, hDC);
+}
 
 
 

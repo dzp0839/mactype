@@ -15,6 +15,7 @@
 
 #define NOMINMAX
 #include <Windows.h>
+#include <Uxtheme.h>
 #include <usp10.h>
 //#include <limits>
 #include <functional>
@@ -32,6 +33,9 @@
 #include <dwrite_1.h>
 #include <dwrite_2.h>
 #include <dwrite_3.h>
+#include <string>
+#include <locale>
+#include <codecvt>
 //#include <wincodec.h>
 //#include <wincodecsdk.h>
 
@@ -85,6 +89,17 @@ void Log(char* Msg);
 void Log(wchar_t* Msg);
 
 
+// convert string to wstring
+std::wstring to_wide_string(const std::string & input);
+
+// convert wstring to string 
+std::string to_byte_string(const std::wstring & input);
+
+// convert a utf-16be string back to utf-16le string
+std::wstring to_utf16le(const std::wstring& input);
+
+wstring to_lower_case(wstring str);
+
 FORCEINLINE HINSTANCE GetDLLInstance()
 {
 	extern HINSTANCE g_hinstDLL;
@@ -116,6 +131,7 @@ public:
 		CS_OWNEDCS,
 		CS_VIRTMEM,
 		CS_DWRITE,
+		CS_DCRELATION,
 	};
 	CCriticalSectionLock(int index=CS_LIBRARY):
 	  m_index(index)

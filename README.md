@@ -1,25 +1,27 @@
 MacType
 ========================
+[日本語](./README_ja-JP.md)
 
 Better font rendering for Windows.
 
-Latest beta
+Latest build
 ------------------
 
-[2019.1-beta6](https://github.com/snowie2000/mactype/releases) (Recommended)
+[Download](https://github.com/snowie2000/mactype/releases/latest)
 
 Official site
 ------------------
 
-MacType official site (download is an older release version): 
+MacType official site: 
 
-http://www.mactype.net (Not recommended)
+http://www.mactype.net (An archived version is restored)
 
 What's new?
 ------------------
 
-- Win10 compatible
-- Updated FreeType (up to git commit 0c4feb72cf976f63d4bf62436bc48f190d0e0c28)
+- Win11 compatible
+- CET compatible
+- Updated FreeType
 - Support for color fonts :sunglasses:
 - New installer
 - Lots of bug fixes
@@ -28,13 +30,12 @@ What's new?
 - Tweaks for diacritics
 - Updates to EasyHook
 - Lower CPU in Tray Mode
-- Better DirectWrite support thanks to しらいと[http://silight.hatenablog.jp]
+- Better DirectWrite support thanks to [しらいと](http://silight.hatenablog.jp)
 - Separate DirectWrite parameter adjustment
 - Traditional Chinese localization greatly improved thanks to GT Wang
 - English localization improved
 - Added Korea localization, thanks to 조현희
 - MultiLang system improved
-- (Does not include Infinality as this is still experimental)
 
 Donation
 ------------------
@@ -58,10 +59,17 @@ Known issues
 
 - Office 2013 does not use DirectWrite or GDI (it uses its own custom rendering), so Office 2013 doesn't work with MacType. If this bothers you you can use Office 2010 which uses GDI or Office 2016+ which uses DirectWrite.
 
-- WPS has a builtin defense that **UNLOADS** MacType automatically which can't be turned off. Please contact its software support for solution. We won't to anything to walkaround it.
+- WPS has a built in defense that **UNLOADS** MacType automatically. The latest version has a workaround [here](https://github.com/snowie2000/mactype/wiki/WPS) thanks to wmjordan.
+
+How to get registry mode back
+-------------
+
+It is no longer possible to enable registry mode via the wizard in Windows 10. 
+
+We have a detailed guide on how you can enable the registry mode manually in [wiki](https://github.com/snowie2000/mactype/wiki/Enable-registry-mode-manually), get your screwdrivers ready before you head over to it.
 
 How to build
 -------------
 
-Check how to build [document](https://github.com/snowie2000/mactype/blob/master/doc/HOWTOBUILD.md)
+Check how to build [document](https://github.com/snowie2000/mactype/blob/directwrite/doc/HOWTOBUILD.md)
 

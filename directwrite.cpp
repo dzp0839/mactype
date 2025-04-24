@@ -18,18 +18,25 @@ void MyDebug(const TCHAR * sz, ...)
 
 #define SET_VAL(x, y) *(DWORD_PTR*)&(x) = *(DWORD_PTR*)&(y)
 // To hook a method, add HOOK_MANUALLY() in hooklist.h and use this.
+
+#ifdef EASYHOOK
+#define ISHOOKED(name) (!!HOOK_##name.Link)
+#else
+#define ISHOOKED(name) (IsHooked_##name)
+#endif
+
 #define HOOK(obj, name, index) { \
-	if (!HOOK_##name.Link) {  \
+	if (!ISHOOKED(name)) {  \
 		AutoEnableDynamicCodeGen dynHelper(true);  \
 		SET_VAL(ORIG_##name, (*reinterpret_cast<void***>(obj.p))[index]);  \
 		hook_demand_##name(false);  \
-		if (!HOOK_##name.Link) { MyDebug(L"##name hook failed"); }  \
+		if (!ISHOOKED(name)) { MyDebug(L"##name hook failed"); }  \
 	}  \
 };
 
 struct ComMethodHooker {
 	// The target function if it has been hooked
-	void*(*lpGetTargetFunc)();
+	BOOL (*lpIsHooked)();
 	// The method the vftable refers to
 	void*(*lpGetMethod)(IUnknown* obj);
 	// Hook the method
@@ -37,10 +44,8 @@ struct ComMethodHooker {
 };
 
 #define COM_METHOD_HOOKER(type, name, index) ComMethodHooker { \
-	[]() -> void* { \
-		if (!HOOK_##name.Link) \
-			return NULL; \
-		return HOOK_##name.Link->TargetProc; \
+	[]() -> BOOL { \
+		return ISHOOKED(name); \
 	}, \
 	[](IUnknown* obj) -> void* { \
 		return (*reinterpret_cast<void***>(obj))[index]; \
@@ -52,8 +57,8 @@ struct ComMethodHooker {
 }
 
 #define COM_METHOD_HOOKER_EMPTY() ComMethodHooker { \
-	[]() -> void* { \
-		return NULL; \
+	[]() -> BOOL { \
+		return false; \
 	}, \
 	[](IUnknown* obj) -> void* { \
 		return NULL; \
@@ -197,7 +202,8 @@ Params::Params() {
 	//	Gamma = pSettings->GammaValue()*pSettings->GammaValue() > 1.3 ? pSettings->GammaValue()*pSettings->GammaValue() / 2 : 0.7f;
 	EnhancedContrast = pSettings->ContrastForDW();
 	ClearTypeLevel = pSettings->ClearTypeLevelForDW();
-	switch (pSettings->GetFontSettings().GetAntiAliasMode())
+	AntialiasMode = (D2D1_TEXT_ANTIALIAS_MODE)D2D1_TEXT_ANTIALIAS_MODE_DEFAULT;
+	switch (pSettings->AntiAliasModeForDW())
 	{
 		case 2:
 		case 4:
@@ -209,9 +215,9 @@ Params::Params() {
 			break;
 		default:
 			PixelGeometry = DWRITE_PIXEL_GEOMETRY_FLAT;
+			AntialiasMode = D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE;
 	}
-
-	AntialiasMode = (D2D1_TEXT_ANTIALIAS_MODE)D2D1_TEXT_ANTIALIAS_MODE_DEFAULT;
+	
 	RenderingMode = (DWRITE_RENDERING_MODE)pSettings->RenderingModeForDW();
 	GrayscaleEnhancedContrast = pSettings->ContrastForDW();
 	switch (pSettings->GetFontSettings().GetHintingMode())
@@ -375,13 +381,13 @@ void HookDevice(ID2D1Device* d2dDevice){
 		CComPtr<ID2D1Device5> ptr6;
 		hr = (d2dDevice)->QueryInterface(&ptr6);
 		if SUCCEEDED(hr) {
-			HOOK(ptr6, CreateDeviceContext6, 17);
+			HOOK(ptr6, CreateDeviceContext6, 19);
 			MyDebug(L"ID2D1Device5 hooked");
 		}
 		CComPtr<ID2D1Device6> ptr7;
 		hr = (d2dDevice)->QueryInterface(&ptr7);
 		if SUCCEEDED(hr) {
-			HOOK(ptr7, CreateDeviceContext7, 18);
+			HOOK(ptr7, CreateDeviceContext7, 20);
 			MyDebug(L"ID2D1Device6 hooked");
 		}
 		return true;
@@ -395,25 +401,7 @@ void HookRenderTargetMethod(
 	ComMethodHooker methodHookers[]
 	) {
 	void* method = methodHookers[hookCategory].lpGetMethod(pD2D1RenderTarget);
-
-	if (D2D1_RENDER_TARGET_CATEGORY != hookCategory) {
-		void* target = methodHookers[D2D1_RENDER_TARGET_CATEGORY].lpGetTargetFunc();
-		if (target != NULL && target == method) {
-			return;
-		}
-	}
-	if (D2D1_RENDER_TARGET1_CATEGORY != hookCategory) {
-		void* target = methodHookers[D2D1_RENDER_TARGET1_CATEGORY].lpGetTargetFunc();
-		if (target != NULL && target == method) {
-			return;
-		}
-	}
-	if (D2D1_DEVICE_CONTEXT_CATEGORY != hookCategory) {
-		void* target = methodHookers[D2D1_DEVICE_CONTEXT_CATEGORY].lpGetTargetFunc();
-		if (target != NULL && target == method) {
-			return;
-		}
-	}
+	if (!method || methodHookers[hookCategory].lpIsHooked()) return;	// fn is not available or already hooked
 
 	methodHookers[hookCategory].lpHookFunc(pD2D1RenderTarget);
 }
@@ -492,7 +480,7 @@ void HookRenderTarget(
 	};
 
 	if (hookCategory == D2D1_RENDER_TARGET_CATEGORY) {
-		static bool loaded1 = [&] {
+		static bool loaded1 = [&] {			
 			CCriticalSectionLock __lock(CCriticalSectionLock::CS_DWRITE);
 			HookRenderTargetMethod(pD2D1RenderTarget, hookCategory, hookDrawText);
 			HookRenderTargetMethod(pD2D1RenderTarget, hookCategory, hookDrawGlyphRun);
@@ -533,7 +521,8 @@ void HookRenderTarget(
 		}();
 	}
 
-	pD2D1RenderTarget->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_DEFAULT);
+	//pD2D1RenderTarget->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_DEFAULT);
+	pD2D1RenderTarget->SetTextAntialiasMode(GetD2DParams()->AntialiasMode);
 	if (GetD2DRenderingParams(NULL)) {
 		pD2D1RenderTarget->SetTextRenderingParams(GetD2DRenderingParams(NULL));
 	}
@@ -1050,7 +1039,7 @@ void WINAPI IMPL_D2D1RenderTarget_SetTextAntialiasMode(
 	D2D1_TEXT_ANTIALIAS_MODE textAntialiasMode
 	) {
 	MyDebug(L"IMPL_D2D1RenderTarget_SetTextAntialiasMode hooked");
-	ORIG_D2D1RenderTarget_SetTextAntialiasMode(This, D2D1_TEXT_ANTIALIAS_MODE_DEFAULT);
+	ORIG_D2D1RenderTarget_SetTextAntialiasMode(This, GetD2DParams()->AntialiasMode);
 }
 
 void WINAPI IMPL_D2D1DeviceContext_SetTextAntialiasMode(
@@ -1058,7 +1047,7 @@ void WINAPI IMPL_D2D1DeviceContext_SetTextAntialiasMode(
 	D2D1_TEXT_ANTIALIAS_MODE textAntialiasMode
 	) {
 	MyDebug(L"IMPL_D2D1DeviceContext_SetTextAntialiasMode hooked");
-	ORIG_D2D1DeviceContext_SetTextAntialiasMode(This, D2D1_TEXT_ANTIALIAS_MODE_DEFAULT);
+	ORIG_D2D1DeviceContext_SetTextAntialiasMode(This, GetD2DParams()->AntialiasMode);
 }
 
 void WINAPI IMPL_D2D1RenderTarget_SetTextRenderingParams(
@@ -1509,9 +1498,10 @@ void HookD2DDll()
 	MessageBox(0, L"HookD2DDll", NULL, MB_OK);
 #endif
 	HMODULE d2d1 = GetModuleHandle(_T("d2d1.dll"));
+	HMODULE dw = GetModuleHandle(_T("dwrite.dll"));
+
 	if (!d2d1)
 		d2d1 = LoadLibrary(_T("d2d1.dll"));
-	HMODULE dw = GetModuleHandle(_T("dwrite.dll"));
 	if (!dw)
 		dw = LoadLibrary(_T("dwrite.dll"));
 	void* D2D1Factory = GetProcAddress(d2d1, "D2D1CreateFactory");

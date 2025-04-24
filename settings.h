@@ -5,7 +5,12 @@
 #include "cache.h"
 #include "hash_list.h"
 #include <VersionHelpers.h>
+#include <freetype/ftmodapi.h>
 #include <IniParser/ParseIni.h>
+#include "json.hpp"
+#include <thread>
+
+using json = nlohmann::json;
 
 #ifdef _WIN64
 #ifdef DEBUG
@@ -21,14 +26,14 @@
 #endif
 #endif
 
-#define MACTYPE_VERSION		20170628
+#define MACTYPE_VERSION		20220712
 #define MAX_FONT_SETTINGS	16
 #define DEFINE_FS_MEMBER(name, param) \
 	int  Get##name() const { return GetParam(param); } \
 	void Set##name(int n)  { SetParam(param, n); }
 
 #define HOOK_MANUALLY HOOK_DEFINE
-#define HOOK_DEFINE(rettype, name, argtype) \
+#define HOOK_DEFINE(rettype, name, argtype, arglist) \
 	extern rettype (WINAPI * ORIG_##name) argtype; \
 	extern rettype WINAPI IMPL_##name argtype;
 #include "hooklist.h"
@@ -73,6 +78,8 @@ public:
 
 typedef map<CFontName,CFontSubResult> CFontNameCache;*/
 
+
+int _StrToInt(LPCTSTR pStr, int nDefault);
 
 class CFontSettings
 {
@@ -236,7 +243,9 @@ interface IControlCenter
 	virtual BOOL WINAPI ClearIndividual() = 0;
 	virtual BOOL WINAPI AddIndividual(WCHAR* fontSetting) = 0;
 	virtual BOOL WINAPI DelIndividual(WCHAR* lpFaceName) = 0;
-	virtual void WINAPI LoadSetting(WCHAR* lpFileName) = 0;
+	virtual void WINAPI LoadSetting(const WCHAR* lpFileName) = 0;
+	virtual HWND WINAPI CreateMessageWnd() = 0;
+	virtual void WINAPI DestroyMessageWnd() = 0;
 };
 class CControlCenter;
 
@@ -263,7 +272,8 @@ private:
 //	bool m_bIsHDBench				: 1;
 //	bool m_bHaveNewerFreeType		: 1;
 	bool							: 0;
-	bool m_bUseCustomLcdFilter;	//使用自定义lcdfilter
+	bool m_bUseCustomLcdFilter;	// use custom lcdfilter
+	bool m_bUseCustomPixelLayout;
 
 	BOOL m_bHintSmallFont;
 	BOOL m_bDirectWrite;
@@ -280,11 +290,14 @@ private:
 	int  m_nFontSubstitutes;
 	int	 m_bFontLink;	//改为可以使用多种参数
 	int  m_nWidthMode;
+
 	int  m_nFontLoader;
 	int	 m_nScreenDpi;	// screen dpi
 	DWORD m_nShadowLightColor;
 	DWORD m_nShadowDarkColor;
 	unsigned char m_arrLcdFilterWeights[5];
+	char m_arrPixelLayout[6];
+	set<int> m_nDisplayAffinity;	// screen affinity set for per-display rendering
 
 	//settings for experimental
 	bool m_bEnableClipBoxFix;
@@ -297,6 +310,7 @@ private:
 	float m_fContrastForDW;
 	float m_fClearTypeLevelForDW;
 	int	m_nRenderingModeForDW;
+	int m_nAntiAliasModeForDW;
     CFontSubstitutesInfo m_FontSubstitutesInfoForDW;
 
 	//FTC_Manager_Newに渡すパラメータ
@@ -349,13 +363,12 @@ private:
 	static float  _GetFreeTypeProfileFloat     (LPCTSTR lpszKey, float fDefault, LPCTSTR lpszFile);
 	static float  _GetFreeTypeProfileBoundFloat(LPCTSTR lpszKey, float fDefault, float fMin, float fMax, LPCTSTR lpszFile);
 	static DWORD  _GetFreeTypeProfileString    (LPCTSTR lpszKey, LPCTSTR lpszDefault, LPTSTR lpszRet, DWORD cch, LPCTSTR lpszFile);
-	static int CALLBACK EnumFontFamProc(const LOGFONT* lplf, const TEXTMETRIC* lptm, DWORD FontType, LPARAM lParam);
 	//template <typename T>
 	static bool AddListFromSection(LPCTSTR lpszSection, LPCTSTR lpszFile, set<wstring> & arr);
 	static bool AddExcludeListFromSection(LPCTSTR lpszSection, LPCTSTR lpszFile, set<wstring> & arr);
 	bool AddIndividualFromSection(LPCTSTR lpszSection, LPCTSTR lpszFile, IndividualArray& arr);
 	bool AddLcdFilterFromSection(LPCTSTR lpszKey, LPCTSTR lpszFile, unsigned char* arr);
-	static int   _StrToInt(LPCTSTR pStr, int nDefault);
+	bool AddPixelModeFromSection(LPCTSTR lpszKey, LPCTSTR lpszFile, char* arr);
 	static float _StrToFloat(LPCTSTR pStr, float fDefault);
 	static int _httoi(const TCHAR *value);
 	void InitInitTuneTable();
@@ -383,6 +396,7 @@ private:
 		, m_nGammaMode(0)
 		, m_fGammaValue(1.0f)
 		, m_fGammaValueForDW(0.0f)
+		, m_nAntiAliasModeForDW(0)
 		, m_fRenderWeight(1.0f)
 		, m_fContrast(1.0f)
 		, m_nMaxHeight(0)
@@ -395,6 +409,7 @@ private:
 		, m_bHintSmallFont(true)
 		, m_bDirectWrite(true)
 		, m_nScreenDpi(96)
+		, m_bUseCustomPixelLayout(false)
 	{
 		ZeroMemory(m_nTuneTable,		sizeof(m_nTuneTable));
 		ZeroMemory(m_nTuneTableR,		sizeof(m_nTuneTableR));
@@ -431,12 +446,15 @@ public:
 	int BolderMode() const { return m_nBolderMode; }
 	int GammaMode() const { return m_nGammaMode; }
 	float GammaValue() const { return m_fGammaValue; }
+	// Only fallback to tranditional ClearType mode when Custom LCD Filter is defined, and pixelLayout is not defined and AAMode is not in pentile.
+	bool HarmonyLCD() const { return m_bUseCustomPixelLayout || m_FontSettings.GetAntiAliasMode() == 6 || !m_bUseCustomLcdFilter; }
 
 	//DW options
 	float GammaValueForDW() const {	return m_fGammaValueForDW;	}
 	float ContrastForDW() const { return m_fContrastForDW;  }
 	float ClearTypeLevelForDW() const { return m_fClearTypeLevelForDW;  }
 	int RenderingModeForDW() const { return m_nRenderingModeForDW; }
+	int AntiAliasModeForDW() const { return m_nAntiAliasModeForDW; }
 	/*const CFontSubstitutesInfo& GetFontSubstitutesInfoForDW() const
 		{ _ASSERTE(m_bDelayedInit); return m_FontSubstitutesInfoForDW; }*/
 
@@ -468,13 +486,6 @@ public:
 // OS version comparsion for magic code
 	bool IsWindows8() const { return m_dwOSMajorVer == 6 && m_dwOSMinorVer == 2; }
 	bool IsWindows81() const { return m_dwOSMajorVer == 6 && m_dwOSMinorVer == 3; }
-	// フォント名よみとり
-	LPCTSTR GetForceFontName() const
-	{
-		_ASSERTE(m_bDelayedInit);
-		LPCTSTR lpszFace = m_lfForceFont.lfFaceName;
-		return lpszFace[0] ? lpszFace : NULL;
-	}
 
 	bool CopyForceFont(LOGFONT& lf, const LOGFONT& lfOrg) const;
 
@@ -488,6 +499,7 @@ public:
 	const int* GetTuneTableR() const { return m_nTuneTableR; }
 	const int* GetTuneTableG() const { return m_nTuneTableG; }
 	const int* GetTuneTableB() const { return m_nTuneTableB; }
+	set<int>& DisplayAffinity() { return m_nDisplayAffinity; }
 
 	bool LoadSettings(HINSTANCE hModule);
 
@@ -546,11 +558,14 @@ extern FreeTypeFontEngine* g_pFTEngine;
 extern BOOL g_ccbCache;
 extern BOOL g_ccbRender;
 
+extern CControlCenter* g_ControlCenter;
+
 class CControlCenter: public IControlCenter
 {
 private:
 	int m_nRefCount;
 	bool m_bDirty;
+	HWND m_msgwnd;
 	enum eMTSettings{
 		ATTR_HINTINGMODE,
 		ATTR_ANTIALIASMODE,
@@ -598,6 +613,44 @@ public:
 		return result;
 	}
 	ULONG WINAPI GetVersion(void){ return MACTYPE_VERSION; };
+	static void UpdateLcdFilter()
+	{
+		const CGdippSettings* pSettings = CGdippSettings::GetInstance();
+		if (pSettings->HarmonyLCD()) {
+			FT_LCDMode_Set(freetype_library, 1);
+			return;
+		}
+		FT_LCDMode_Set(freetype_library, 0);
+		const int nLcdFilter = pSettings->LcdFilter();
+		if ((int)FT_LCD_FILTER_NONE <= nLcdFilter && nLcdFilter < (int)FT_LCD_FILTER_MAX) {
+			FT_Library_SetLcdFilter(freetype_library, (FT_LcdFilter)nLcdFilter);
+			if (pSettings->UseCustomLcdFilter())
+			{
+				unsigned char buff[5];
+				memcpy(buff, pSettings->LcdFilterWeights(), sizeof(buff));
+				FT_Library_SetLcdFilterWeights(freetype_library, buff);
+			}
+			/*
+			else
+			switch (nLcdFilter)
+			{
+			case FT_LCD_FILTER_NONE:
+			case FT_LCD_FILTER_DEFAULT:
+			case FT_LCD_FILTER_LEGACY:
+			{
+			FT_Library_SetLcdFilterWeights(freetype_library,
+			(unsigned char*)"\x10\x40\x70\x40\x10" );
+			break;
+			}
+			case FT_LCD_FILTER_LIGHT:
+			default:
+			FT_Library_SetLcdFilterWeights(freetype_library,
+			(unsigned char*)"\x00\x55\x56\x55\x00" );
+			}*/
+
+		}
+	}
+
 	BOOL WINAPI SetIntAttribute(int eSet, int nValue)
 	{
 		CGdippSettings* pSettings = CGdippSettings::GetInstance();
@@ -627,7 +680,7 @@ public:
 			break;
 		case ATTR_LcdFilter:
 			pSettings->m_nLcdFilter = nValue;
-			FT_Library_SetLcdFilter(freetype_library, (FT_LcdFilter)nValue);
+			UpdateLcdFilter();
 			break;
 		case ATTR_BolderMode:
 			pSettings->m_nBolderMode = nValue;
@@ -698,7 +751,7 @@ public:
 					break;
 				}
 				for (int i=0; i<3; i++) {
-					pSettings->m_nShadow[i] = pSettings->_StrToInt(token.GetArgument(i), 0);
+					pSettings->m_nShadow[i] = _StrToInt(token.GetArgument(i), 0);
 					/*if (m_nShadow[i] <= 0) {
 						goto SKIP;
 					}*/
@@ -711,7 +764,7 @@ public:
 				if (token.GetCount()>=6)	//如果指定了深色阴影
 				{
 					pSettings->m_nShadowLightColor = pSettings->_httoi(token.GetArgument(5));	//读取阴影
-					pSettings->m_nShadow[3] = pSettings->_StrToInt(token.GetArgument(4), pSettings->m_nShadow[2]); //读取深度
+					pSettings->m_nShadow[3] = _StrToInt(token.GetArgument(4), pSettings->m_nShadow[2]); //读取深度
 				}
 				else
 				{
@@ -860,7 +913,7 @@ public:
 				LPCTSTR arg = token.GetArgument(i);
 				if (!arg)
 					break;
-				const int n = pSettings->_StrToInt(arg, fsCommon.GetParam(i));
+				const int n = _StrToInt(arg, fsCommon.GetParam(i));
 				fs.SetParam(i, n);
 			}
 
@@ -889,7 +942,7 @@ public:
 		}
 		m_bDirty = true;
 		return true;};
-	void WINAPI LoadSetting(WCHAR* lpFileName)
+	void WINAPI LoadSetting(const WCHAR* lpFileName)
 	{
 		CGdippSettings* pSettings = CGdippSettings::GetInstance();
 		ClearIndividual();
@@ -902,8 +955,12 @@ public:
 		RefreshAlphaTable();
 		RefreshSetting();
 	}
-	CControlCenter():m_nRefCount(1), m_bDirty(false){};
-	~CControlCenter(){};
+	CControlCenter():m_nRefCount(1), m_bDirty(false), m_msgwnd(NULL) {
+		g_ControlCenter = this;
+	};
+	~CControlCenter(){
+		g_ControlCenter = NULL;
+	};
 	static void WINAPI ReloadConfig()
 	{
 		//CCriticalSectionLock __lock(CCriticalSectionLock::CS_LIBRARY);
@@ -919,5 +976,98 @@ public:
 		UpdateLcdFilter();
 		if (g_pFTEngine)
 			g_pFTEngine->ReloadAll();
+	}
+	HWND WINAPI CreateMessageWnd() {
+		HANDLE event = CreateEvent(NULL, true, false, NULL);
+
+		auto run = [&]() -> void {
+			if (this->m_msgwnd) {
+				SendMessage(this->m_msgwnd, WM_CLOSE, 0, 0);
+			}
+			WNDCLASS wndclass;
+			wndclass.style = 0;
+			wndclass.lpfnWndProc = [](HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) -> LRESULT {
+				return g_ControlCenter ? g_ControlCenter->MsgProc(hwnd, message, wParam, lParam) : DefWindowProc(hwnd, message, wParam, lParam);
+			};
+			wndclass.cbClsExtra = 0;
+			wndclass.cbWndExtra = 0;
+			wndclass.hInstance = 0;
+			wndclass.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+			wndclass.hCursor = LoadCursor(NULL, IDC_ARROW);
+			wndclass.hbrBackground = (HBRUSH)GetStockObject(WHITE_BRUSH);
+			wndclass.lpszMenuName = NULL;
+			wndclass.lpszClassName = L"MT_CMSGWND";
+			RegisterClass(&wndclass);
+			this->m_msgwnd = CreateWindow(L"MT_CMSGWND", NULL, 0, 0, 0, 0, 0, HWND_MESSAGE, 0, 0, NULL);
+			SetEvent(event);
+
+			MSG msg;
+			while (GetMessage(&msg, NULL, 0, 0)) //消息循环
+			{
+				TranslateMessage(&msg);
+				DispatchMessage(&msg);
+			}
+			DestroyWindow(this->m_msgwnd);
+		};
+		auto wndThread = thread(run);
+		wndThread.detach();
+		WaitForSingleObject(event, 10000);
+		CloseHandle(event);
+		return this->m_msgwnd;
+	}
+
+	void RedrawCurrentApp() {
+		auto EnumCurrentProcWindow = [](HWND hwnd, LPARAM lparam)->BOOL {
+			DWORD pid = 0;
+			GetWindowThreadProcessId(hwnd, &pid);
+			if (pid == lparam) {
+				RedrawWindow(hwnd, NULL, 0, RDW_ALLCHILDREN | RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
+			}
+			return true;
+		};
+
+		EnumWindows(EnumCurrentProcWindow, GetCurrentProcessId());
+	}
+
+	LRESULT WINAPI MsgProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
+		switch (msg) {
+			case WM_COPYDATA: {
+				COPYDATASTRUCT* data = (COPYDATASTRUCT*)lparam;
+				if (data->cbData && data->lpData) {	// ignore invalid request.
+					string json;
+					json.resize(data->cbData);
+					memcpy((void*)json.c_str(), data->lpData, data->cbData);
+					// now parse the json string
+					auto jsonobj = json::parse(json.begin(), json.end());
+					string command = jsonobj["command"].get<std::string>();
+					// various command dispatch
+					if (command == "loadprofile") {	// load target profile from disk
+						string filename = jsonobj["file"].get<std::string>();
+						if (filename.length()) {
+							this->LoadSetting(to_wide_string(filename).c_str());
+							RedrawCurrentApp();
+						}
+						return ERROR_SUCCESS;
+					}
+					if (command == "ping") {
+						//__asm db 0xcc;	// cause debugger to break
+						//DebugBreak();
+						return ERROR_SUCCESS;
+					}
+				}
+				break;
+			}
+			default: {
+				return DefWindowProc(hwnd, msg, wparam, lparam);
+			}
+		}
+		return 0;
+	}
+
+	void WINAPI DestroyMessageWnd() {
+		if (m_msgwnd) {
+			DestroyWindow(m_msgwnd);
+			m_msgwnd = NULL;
+		}
 	}
 };
